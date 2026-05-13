@@ -1,3 +1,4 @@
+import inspect
 import math
 import re
 from copy import deepcopy
@@ -8,15 +9,17 @@ import lightning.pytorch as pl
 import numpy as np
 import torch
 from lightning.fabric.loggers.tensorboard import _TENSORBOARD_AVAILABLE
+from lightning.pytorch.accelerators.cuda import CUDAAccelerator
+from lightning.pytorch.accelerators.mps import MPSAccelerator
 from lightning.pytorch.callbacks import ModelCheckpoint, TQDMProgressBar
 from lightning.pytorch.loggers import TensorBoardLogger
-from lightning.pytorch.utilities.rank_zero import rank_zero_info, rank_zero_only
+from lightning.pytorch.strategies import SingleDeviceStrategy, Strategy, StrategyRegistry
+from lightning.pytorch.utilities.rank_zero import rank_zero_info, rank_zero_only, rank_zero_warn
 from torch.optim.lr_scheduler import LambdaLR
 from torch.utils.data.distributed import Sampler
 
 import utils
 from utils.hparams import hparams
-
 
 # ==========LR schedulers==========
 
@@ -427,75 +430,110 @@ def get_strategy(
     strategy={"name": "auto"},
     precision=None,
 ):
-    from lightning.fabric.utilities.device_parser import _determine_root_gpu_device
-    from lightning.pytorch.accelerators import AcceleratorRegistry
-    from lightning.pytorch.accelerators.cuda import CUDAAccelerator
-    from lightning.pytorch.accelerators.mps import MPSAccelerator
-    from lightning.pytorch.strategies import Strategy, SingleDeviceStrategy, StrategyRegistry
-    from lightning.pytorch.trainer.connectors import accelerator_connector
-    from lightning.pytorch.utilities.rank_zero import rank_zero_warn
-    class _DsAcceleratorConnector(accelerator_connector._AcceleratorConnector):
-        def __init__(self) -> None:
-            accelerator_connector._register_external_accelerators_and_strategies()
-            self._registered_strategies = StrategyRegistry.available_strategies()
-            self._accelerator_types = AcceleratorRegistry.available_accelerators()
-            self._parallel_devices = []
-            self._check_config_and_set_final_flags(
-                strategy=strategy["name"],
-                accelerator=accelerator,
-                precision=precision,
-                plugins=[],
-                sync_batchnorm=False,
-            )
-            if self._accelerator_flag == "auto":
-                self._accelerator_flag = self._choose_auto_accelerator()
-            elif self._accelerator_flag == "gpu":
-                self._accelerator_flag = self._choose_gpu_accelerator_backend()
-            self._check_device_config_and_set_final_flags(devices=devices, num_nodes=num_nodes)
-            self._set_parallel_devices_and_init_accelerator()
-            if self._strategy_flag == "auto":
-                self._strategy_flag = self._choose_strategy()
-            self._check_strategy_and_fallback()
-            self._init_strategy()
-            for k in ["colossalai", "bagua", "hpu", "hpu_parallel", "hpu_single", "ipu", "ipu_strategy"]:
-                if k in StrategyRegistry:
-                    StrategyRegistry.remove(k)
+    """
+    重写后的 get_strategy，不再依赖 _AcceleratorConnector 内部类。
+    直接通过公共 API 推断和构建 Strategy 对象。
+    """
+    # 1. 处理如果传入的已经是 Strategy 实例的情况
+    if isinstance(strategy, Strategy):
+        rank_zero_warn(
+            "Passed strategy is already an instance. Custom configurations from dict won't be applied. "
+            "To use custom configurations, please specify the strategy name explicitly."
+        )
+        return strategy
 
-        def _init_strategy(self) -> None:
-            assert isinstance(self._strategy_flag, (str, Strategy))
-            if isinstance(self._strategy_flag, str):
-                if self._strategy_flag not in StrategyRegistry:
-                    available_names = ", ".join(sorted(StrategyRegistry.available_strategies())) or "none"
-                    raise KeyError(f"Invalid strategy name {strategy['name']}. Available names: {available_names}")
-                data = StrategyRegistry[self._strategy_flag]
-                params = {}
-                # Replicate additional logic for _choose_strategy when dealing with single device strategies
-                if issubclass(data["strategy"], SingleDeviceStrategy):
-                    if self._accelerator_flag == "hpu":
-                        params = {"device": torch.device("hpu")}
-                    elif self._accelerator_flag == "tpu":
-                        params = {"device": self._parallel_devices[0]}
-                    elif data["strategy"] is SingleDeviceStrategy:
-                        if isinstance(self._accelerator_flag, (CUDAAccelerator, MPSAccelerator)) or (
-                            isinstance(self._accelerator_flag, str) and self._accelerator_flag in ("cuda", "gpu", "mps")
-                        ):
-                            params = {"device": _determine_root_gpu_device(self._parallel_devices)}
-                        else:
-                            params = {"device": "cpu"}
-                    else:
-                        raise NotImplementedError
-                params.update(data["init_params"])
-                params.update({k: v for k, v in strategy.items() if k != "name"})
-                self.strategy = data["strategy"](**utils.filter_kwargs(params, data["strategy"]))
-            elif isinstance(self._strategy_flag, SingleDeviceStrategy):
-                params = {"device": self._strategy_flag.root_device}
-                params.update({k: v for k, v in strategy.items() if k != "name"})
-                self.strategy = self._strategy_flag.__class__(**utils.filter_kwargs(params, self._strategy_flag.__class__))
+    # 确保 strategy 是字典格式
+    if isinstance(strategy, str):
+        strategy = {"name": strategy}
+
+    strat_name = strategy.get("name", "auto")
+    strat_kwargs = {k: v for k, v in strategy.items() if k != "name"}
+
+    # 2. 解析 Accelerator
+    acc_flag = accelerator
+    if acc_flag == "auto":
+        if CUDAAccelerator.is_available():
+            acc_flag = "cuda"
+        elif MPSAccelerator.is_available():
+            acc_flag = "mps"
+        else:
+            acc_flag = "cpu"
+    elif acc_flag == "gpu":
+        # Lightning 内部通常将 gpu 映射为 cuda 或 mps
+        acc_flag = "cuda" if CUDAAccelerator.is_available() else "mps"
+
+    # 3. 解析 Devices 数量
+    if devices == "auto":
+        if acc_flag == "cuda":
+            num_devices = torch.cuda.device_count()
+        elif acc_flag == "mps":
+            num_devices = 1
+        else:
+            num_devices = 1
+    elif isinstance(devices, (list, tuple)):
+        num_devices = len(devices)
+    else:
+        num_devices = int(devices)
+
+    # 4. 推断 Strategy 名称 (替换原先的 _choose_strategy)
+    if strat_name == "auto":
+        if num_devices <= 1 and num_nodes <= 1:
+            strat_name = "single_device"  # 单卡/单节点使用单卡策略
+        else:
+            strat_name = "ddp"            # 多卡默认使用 DDP
+
+    # 5. 清理不支持的第三方 Registry (原逻辑保留)
+    for k in ["colossalai", "bagua", "hpu", "hpu_parallel", "hpu_single", "ipu", "ipu_strategy"]:
+        if k in StrategyRegistry:
+            try:
+                StrategyRegistry.remove(k)
+            except Exception:
+                pass
+
+    # 6. 实例化 Strategy
+    if strat_name == "single_device":
+        # 单卡策略不在 Registry 中动态注册，需要直接实例化
+        if acc_flag == "cuda":
+            from lightning.fabric.utilities.device_parser import _determine_root_gpu_device
+            if isinstance(devices, (list, tuple)):
+                device = _determine_root_gpu_device(devices)
             else:
-                rank_zero_warn(
-                    f"Inferred strategy {self._strategy_flag.__class__.__name__} cannot take custom configurations."
-                    f"To use custom configurations, please specify the strategy name explicitly."
-                )
-                self.strategy = self._strategy_flag
+                device = torch.device("cuda", 0)
+        elif acc_flag == "mps":
+            device = torch.device("mps")
+        else:
+            device = torch.device("cpu")
 
-    return _DsAcceleratorConnector().strategy
+        params = {"device": device}
+        if precision is not None:
+            params["precision"] = precision  # 增加 precision
+        params.update(strat_kwargs)
+        
+        # 过滤掉 SingleDeviceStrategy 不支持的参数
+        sig = inspect.signature(SingleDeviceStrategy.__init__)
+        valid_keys = set(sig.parameters.keys()) - {'self'}
+        filtered_params = {k: v for k, v in params.items() if k in valid_keys}
+        
+        return SingleDeviceStrategy(**filtered_params)
+
+    elif strat_name in StrategyRegistry:
+        # 从 Registry 实例化 (如 ddp, deepspeed, fsdp 等)
+        data = StrategyRegistry[strat_name]
+        strat_cls = data["strategy"]
+        init_params = data.get("init_params", {})
+
+        # 合并参数: Registry默认参数 < 用户传入的自定义参数 < precision
+        params = {**init_params, **strat_kwargs}
+        if precision is not None:
+            params["precision"] = precision  # 增加 precision
+
+        # 过滤掉该 Strategy 类不支持的非法参数
+        sig = inspect.signature(strat_cls.__init__)
+        valid_keys = set(sig.parameters.keys()) - {'self'}
+        filtered_params = {k: v for k, v in params.items() if k in valid_keys}
+
+        return strat_cls(**filtered_params)
+
+    else:
+        available_names = ", ".join(sorted(StrategyRegistry.available_strategies())) or "none"
+        raise KeyError(f"Invalid strategy name '{strat_name}'. Available names: {available_names}")

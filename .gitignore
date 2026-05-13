@@ -3,6 +3,7 @@ ckpt/
 *.ckpt
 *.pt
 *.pth
+data/
 
 # Binary datasets
 data/*/binary/

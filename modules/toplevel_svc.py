@@ -10,10 +10,13 @@ from basics.base_module import CategorizedModule
 from modules.aux_decoder import AuxDecoderAdaptor
 from modules.commons.common_layers import (
     NormalInitEmbedding as Embedding,
+)
+from modules.commons.common_layers import (
     XavierUniformInitLinear as Linear,
 )
 from modules.condition_refiner import ConditionRefiner
-from modules.content_encoder import ContentVecExtractor, align_frame_rate
+from modules.content_encoder import ContentVecExtractor2 as ContentVecExtractor
+from modules.content_encoder import align_frame_rate
 from modules.core import RectifiedFlow
 from modules.variance_predictor import SVCVariancePredictor
 from utils.hparams import hparams

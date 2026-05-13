@@ -11,7 +11,7 @@ import numpy as np
 import torch
 from tqdm import tqdm
 
-from modules.content_encoder import ContentVecExtractor
+from modules.content_encoder import ContentVecExtractor2 as ContentVecExtractor
 from modules.pe import initialize_pe
 from utils.binarizer_utils import (
     SinusoidalSmoothingConv1d,

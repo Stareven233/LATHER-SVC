@@ -2,7 +2,8 @@ from typing import Union
 
 import librosa
 import numpy as np
-import parselmouth
+
+# import parselmouth
 import torch
 
 from modules.nsf_hifigan.nvSTFT import STFT
@@ -58,6 +59,7 @@ def get_pitch_parselmouth(
     :param interp_uv: Interpolate unvoiced parts
     :return: f0, uv
     """
+    import parselmouth
     hop_size = int(np.round(hop_size * speed))
     time_step = hop_size / samplerate
 

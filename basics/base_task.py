@@ -11,20 +11,15 @@ import utils
 
 matplotlib.use('Agg')
 
+import lightning.pytorch as pl
 import torch
 import torch.utils.data
-from torchmetrics import Metric, MeanMetric
-import lightning.pytorch as pl
 from lightning.pytorch.utilities.rank_zero import rank_zero_debug, rank_zero_info, rank_zero_only
+from torchmetrics import MeanMetric, Metric
 
 from basics.base_module import CategorizedModule
 from utils.hparams import hparams
-from utils.training_utils import (
-    DsModelCheckpoint, DsTQDMProgressBar,
-    DsBatchSampler, build_logger,
-    get_latest_checkpoint_path, get_strategy
-)
-from utils.phoneme_utils import load_phoneme_dictionary
+from utils.training_utils import DsBatchSampler, DsModelCheckpoint, DsTQDMProgressBar, build_logger, get_latest_checkpoint_path, get_strategy
 
 torch.multiprocessing.set_sharing_strategy(os.getenv('TORCH_SHARE_STRATEGY', 'file_system'))
 
@@ -72,7 +67,10 @@ class BaseTask(pl.LightningModule):
         self.skip_immediate_ckpt_save = False
 
         self.use_phoneme_dictionary = hparams.get('use_phoneme_dictionary', True)
-        self.phoneme_dictionary = load_phoneme_dictionary() if self.use_phoneme_dictionary else None
+        self.phoneme_dictionary = None
+        if self.use_phoneme_dictionary:
+            from utils.phoneme_utils import load_phoneme_dictionary
+            load_phoneme_dictionary()
         self.build_model()
         # Inject LoRA if enabled
         lora_cfg = hparams.get('lora', {})
@@ -511,6 +509,7 @@ class BaseTask(pl.LightningModule):
 
     def on_load_checkpoint(self, checkpoint):
         from lightning.pytorch.trainer.states import RunningStage
+
         from utils import simulate_lr_scheduler
         # If LoRA is enabled, optimizer parameter groups differ (only LoRA/bias are trainable).
         # Drop optimizer & scheduler states to avoid mismatched param group size errors when resuming.
