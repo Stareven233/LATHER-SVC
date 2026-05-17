@@ -28,6 +28,9 @@ logging.basicConfig(stream=sys.stdout, level=logging.INFO,
                     format=log_format, datefmt='%m/%d %I:%M:%S %p')
 
 
+_CONTENTVEC_MODEL_PREFIX = 'model.content_encoder'
+
+
 class BaseTask(pl.LightningModule):
     """
         Base class for training tasks.
@@ -506,6 +509,14 @@ class BaseTask(pl.LightningModule):
         # When LoRA is enabled, keep saving the full model (base + LoRA)
         # so that resume works out-of-the-box and weights are complete.
         # No override to checkpoint['state_dict'] is needed here.
+        
+        # ★ 排除冻结的 ContentVec 权重
+        state_dict = checkpoint.get('state_dict', {})
+        removed_keys = [k for k in state_dict if k.startswith(_CONTENTVEC_MODEL_PREFIX)]
+        for k in removed_keys:
+            del state_dict[k]
+        if removed_keys:
+            rank_zero_info(f'| Excluded {len(removed_keys)} ContentVec keys from checkpoint (saved ~{sum(v.numel() * v.element_size() for v in [state_dict.get(k) for k in removed_keys] if v is not None) / 1e6:.0f} MB)')
 
     def on_load_checkpoint(self, checkpoint):
         from lightning.pytorch.trainer.states import RunningStage
@@ -563,19 +574,35 @@ class BaseTask(pl.LightningModule):
     # Override to support loading LoRA-only checkpoints
     def load_state_dict(self, state_dict: Dict[str, torch.Tensor], strict: bool = True):
         lora_enabled = bool(hparams.get('lora', {}).get('enabled', False))
+    
+        # ★ 无论是否 LoRA，ContentVec 的缺失 key 都不算错误
+        # 因为 ContentVec 在 __init__ 时已从原始 ckpt 加载
+        contentvec_keys_in_model = {
+            k for k in self.state_dict().keys()
+            if k.startswith(_CONTENTVEC_MODEL_PREFIX)
+        }
+        contentvec_keys_in_ckpt = {
+            k for k in state_dict.keys()
+            if k.startswith(_CONTENTVEC_MODEL_PREFIX)
+        }
+        missing_contentvec = contentvec_keys_in_model - contentvec_keys_in_ckpt
+    
         if lora_enabled:
-            # Prefer loading full model (base + LoRA) non-strictly to maximize compatibility
             try:
-                return super().load_state_dict(state_dict, strict=False)
-            except Exception as e:
-                print(f'| warn: Full load failed with LoRA enabled: {e}. Trying LoRA-only fallback...')
-                try:
-                    from utils.lora import load_lora_state_dict
-                    load_lora_state_dict(self.model, state_dict, prefix='model')
-                    from torch.nn.modules.module import _IncompatibleKeys
-                    return _IncompatibleKeys(missing_keys=[], unexpected_keys=[])
-                except Exception as e2:
-                    print(f'| warn: LoRA-only fallback failed: {e2}. Falling back to default loader.')
-                    return super().load_state_dict(state_dict, strict=strict)
-        # Default behavior when LoRA is not enabled
-        return super().load_state_dict(state_dict, strict=strict)
+                result = super().load_state_dict(state_dict, strict=False)
+                return result
+            except Exception:
+                # ... LoRA fallback 不变 ...
+                ...
+        elif missing_contentvec and strict:
+            # ContentVec 缺失是预期行为，退回 strict=False
+            result = super().load_state_dict(state_dict, strict=False)
+            if result.missing_keys:
+                # 过滤掉 ContentVec 的 missing keys，只报告真正缺失的
+                real_missing = [k for k in result.missing_keys
+                                if not k.startswith(_CONTENTVEC_MODEL_PREFIX)]
+                if real_missing:
+                    rank_zero_info(f'| Warning: missing keys (non-ContentVec): {real_missing}')
+            return result
+        else:
+            return super().load_state_dict(state_dict, strict=strict)

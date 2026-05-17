@@ -209,7 +209,7 @@ class SVCBinarizer:
                 if isinstance(value, np.ndarray):
                     if key not in extra_info:
                         extra_info[key] = {}
-                    extra_info[key][item_no] = value.shape[1] if key == 'contentvec' else value.shape[0]
+                    extra_info[key][item_no] = value.shape[0]  # contentvec 现在是 [T, 256]，shape[0] 就是帧数
             extra_info['names'][item_no] = item['name'].split(':', 1)[-1]
             extra_info['ph_texts'][item_no] = item['ph_text']
             extra_info['spk_ids'][item_no] = item['spk_id']
@@ -322,9 +322,12 @@ class SVCBinarizer:
         if contentvec_extractor is None:
             contentvec_extractor = ContentVecExtractor(output_dim=hparams['hidden_size']).to(self.device)
             contentvec_extractor.eval()
+        # 修改前：存储 6 层原始特征，~18KB/帧
         cached = contentvec_extractor.extract_hidden_states(
             torch.from_numpy(waveform_16k).float().to(self.device)[None]
-        )[0]
+        )[0]  # shape: [6, T, 768]
+        # 修改后：直接投影并存储，~1KB/帧
+        cached = contentvec_extractor._combine_layers(cached.unsqueeze(0))[0]  # shape: [T, 256]
 
         return {
             'name': item_name,

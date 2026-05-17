@@ -1,0 +1,71 @@
+base_config:
+  - ./svc_base.yaml
+
+audio_sample_rate: 44100
+hop_size: 512
+sampling_steps: 20
+K_step: 400
+# max_batch_frames: 每 batch 最大帧数
+  # 根据每个样本的帧长度（dataset.num_frames(index)）动态拼 batch，确保一个 batch 里所有样本的总帧数不超过 max_batch_frames。
+  # 举个例子，默认 max_batch_frames = 48000：
+  # 如果一个样本有 2000 帧（约 23 秒），那这个 batch 最多塞 24 个这样的样本
+  # 如果一个样本只有 500 帧（约 6 秒），那可以塞 96 个
+max_batch_frames: 6000
+max_batch_size: 5
+
+binary_data_dir: data/svc_quality/megumin
+
+# noe
+binarization_args:
+  shuffle: true
+  # 降低HDF5读取对硬盘的io压力
+  num_workers: 2
+pe_ckpt: ckpt/rmvpe/model.pt
+vocoder_ckpt: ckpt/vocoder/pc_nsf_hifigan_44.1k_hop512_128bin_2025.02/model.ckpt
+contentvec:
+  checkpoint_path: ckpt/contentvec/lengyue233_cvec-best.bin
+
+datasets:
+  # === 在这里添加你的数据集 ===
+  # 每个说话人一个条目，示例：
+  - raw_data_dir: data/megumin
+    speaker: megumin
+    spk_id: 0
+    language: jp
+    artifact_level: 0  # 0 = 高质量干声, 1 = 有瑕疵/拼接数据
+    test_prefixes:
+      - '@val_'
+num_spk: 1
+
+val_with_vocoder: true
+num_valid_plots: 10
+
+# max_updates: 总训练步数（默认 160000）
+max_updates: 9
+log_interval: 2
+num_ckpt_keep: 1
+# val_check_interval: 验证间隔（默认 2000 步）
+val_check_interval: 7
+permanent_ckpt_start: 0
+permanent_ckpt_interval: 7
+pl_trainer_devices: auto
+# pl_trainer_precision: 训练精度（默认 16-mixed）
+pl_trainer_precision: 16-mixed
+
+# 降低显存
+backbone_args:
+  num_channels: 256
+  num_layers: 2
+  kernel_size: 31
+  dropout_rate: 0.0
+shallow_diffusion_args:
+  train_aux_decoder: true
+  train_diffusion: true
+  val_gt_start: false
+  aux_decoder_arch: convnext
+  aux_decoder_args:
+    num_channels: 128
+    num_layers: 2
+    kernel_size: 7
+    dropout_rate: 0.1
+  aux_decoder_grad: 0.1

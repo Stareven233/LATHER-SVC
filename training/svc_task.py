@@ -1,4 +1,5 @@
 import matplotlib
+import matplotlib.pyplot as plt
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -24,6 +25,14 @@ def lengths_to_mask(lengths: torch.Tensor, max_length: int) -> torch.Tensor:
     return positions < lengths[:, None]
 
 
+
+# 按各方差值域归一化，让不同量纲的损失可比
+value_ranges = {
+    'breathiness': 76.0,   # [-96, -20]
+    'voicing': 84.0,       # [-96, -12]
+    'tension': 20.0,       # [-10, 10]
+}
+
 class SVCDataset(BaseDataset):
     def __init__(self, prefix, preload=False):
         super().__init__(prefix, hparams['dataset_size_key'], preload)
@@ -38,7 +47,9 @@ class SVCDataset(BaseDataset):
         breathiness = utils.collate_nd([s['breathiness'] for s in samples], 0.0)
         voicing = utils.collate_nd([s['voicing'] for s in samples], 0.0)
         tension = utils.collate_nd([s['tension'] for s in samples], 0.0)
-        contentvec = utils.collate_nd([s['contentvec'].transpose(0, 1) for s in samples], 0.0).permute(0, 2, 1, 3)
+        # contentvec 是 [T, 256]，直接 collate
+        contentvec = utils.collate_nd([s['contentvec'] for s in samples], 0.0)
+
         mel_lengths = torch.LongTensor([s['mel'].shape[0] for s in samples])
         contentvec_lengths = torch.LongTensor([s['contentvec'].shape[1] for s in samples])
         spk_ids = torch.LongTensor([s['spk_id'] for s in samples])
@@ -57,7 +68,12 @@ class SVCDataset(BaseDataset):
 
 
 class SVCTask(BaseTask):
-    variance_names = ('breathiness', 'voicing', 'tension')
+    # 按各方差值域归一化，让不同量纲的损失可比
+    variance_ranges = {
+        'breathiness': 76.0,   # [-96, -20]
+        'voicing': 84.0,       # [-96, -12]
+        'tension': 20.0,       # [-10, 10]
+    }
 
     def __init__(self):
         super().__init__()
@@ -92,8 +108,8 @@ class SVCTask(BaseTask):
         self.register_validation_loss('mel_loss')
         self.register_validation_loss('var_loss')
 
-    def masked_mse(self, prediction: torch.Tensor, target: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
-        loss = (prediction - target) ** 2
+    def masked_varience_mse(self, prediction: torch.Tensor, target: torch.Tensor, value_range: float, mask: torch.Tensor) -> torch.Tensor:
+        loss = ((prediction - target) / value_range) ** 2
         loss = loss * mask
         denom = mask.sum().clamp_min(1.0)
         return loss.sum() / denom
@@ -120,12 +136,12 @@ class SVCTask(BaseTask):
     def prepare_content_features(self, sample):
         features = []
         for batch_idx in range(sample['size']):
-            content_length = int(sample['contentvec_lengths'][batch_idx].item())
+            # 改进后能极大节省预处理文件大小，但contentvec投影学习失效，实为下策
             mel_length = int(sample['mel_lengths'][batch_idx].item())
-            cached = sample['contentvec'][batch_idx:batch_idx + 1, :, :content_length, :]
-            projected = self.model.content_encoder.from_cached_features(cached)
-            projected = align_frame_rate(projected, mel_length)
-            features.append(projected[0])
+            content_length = int(sample['contentvec_lengths'][batch_idx].item())
+            feat = sample['contentvec'][batch_idx:batch_idx + 1, :content_length]  # [1, T, 256]
+            feat = align_frame_rate(feat, mel_length)  # [1, mel_length, 256]
+            features.append(feat[0])
         return utils.collate_nd(features, 0.0)
 
     def run_model(self, sample, infer=False):
@@ -166,9 +182,9 @@ class SVCTask(BaseTask):
 
         frame_mask = non_padding.squeeze(-1)
         variance_loss = 0.0
-        for name in self.variance_names:
-            variance_loss = variance_loss + self.masked_mse(variance_pred[name], sample[name], frame_mask)
-        losses['var_loss'] = self.lambda_var_loss * (variance_loss / len(self.variance_names))
+        for name, _range in self.variance_ranges.items():
+            variance_loss = variance_loss + self.masked_varience_mse(variance_pred[name], sample[name], _range, frame_mask)
+        losses['var_loss'] = self.lambda_var_loss * (variance_loss / len(self.variance_ranges))
         return losses
 
     def on_train_start(self):
@@ -245,8 +261,7 @@ class SVCTask(BaseTask):
             f"{self.valid_dataset.metadata['spk_names'][data_idx]} - "
             f"{self.valid_dataset.metadata['names'][data_idx]}"
         )
-        self.logger.all_rank_experiment.add_figure(
-            f'{name_prefix}_{data_idx}',
-            spec_to_figure(spec_cat[:mel_len], vmin, vmax, title_text),
-            global_step=self.global_step,
-        )
+
+        fig = spec_to_figure(spec_cat[:mel_len], vmin, vmax, title_text)
+        self.logger.all_rank_experiment.add_figure(f'{name_prefix}_{data_idx}', fig, global_step=self.global_step)
+        plt.close(fig)  # ← 加这行

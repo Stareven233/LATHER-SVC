@@ -318,6 +318,11 @@ class ContentVecExtractor2(nn.Module):
         self.proj = Linear(self.input_dim, self.output_dim)
         self.model = self._load_model()
         
+        if self.freeze and not hparams.get('infer', False):
+            # 训练时不需要原始模型，释放 ~300MB
+            del self.model
+            self.model = None
+
         if self.model is not None and self.freeze:
             self.model.eval()
             for param in self.model.parameters():
